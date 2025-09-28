@@ -1438,7 +1438,7 @@ ScaLBL_GreyscaleColorModel::SeedPhaseField(const double seed_water_in_oil) {
 
 //TODO for temporary use - writing visualization files should be included in the analysis framework in the future
 void ScaLBL_GreyscaleColorModel::WriteVisFiles() {
-    // Write visualization data; formats controlled by Visualization DB
+    //NOTE: write_silo is always true
 
     std::vector<IO::MeshDataStruct> visData;
     fillHalo<double> fillData(Dm->Comm, Dm->rank_info,
@@ -1452,7 +1452,8 @@ void ScaLBL_GreyscaleColorModel::WriteVisFiles() {
     auto PressureVar = std::make_shared<IO::Variable>();
     auto PhaseVar = std::make_shared<IO::Variable>();
 
-    // Create the MeshDataStruct (format initialized just before write)
+    // Create the MeshDataStruct
+    IO::initialize("", "silo", "false");
     visData.resize(1);
     visData[0].meshName = "domain";
     visData[0].mesh =
@@ -1522,7 +1523,6 @@ void ScaLBL_GreyscaleColorModel::WriteVisFiles() {
         fillData.copy(DataTemp, VelzData);
     }
 
-
     if (vis_db->getWithDefault<bool>("save_distance", false)) {
 
         SignDistVar->name = "SignDist";
@@ -1536,14 +1536,7 @@ void ScaLBL_GreyscaleColorModel::WriteVisFiles() {
         fillData.copy(Averages->SDs, SignData);
     }
 
-    bool writeSilo = vis_db->getWithDefault<bool>("write_silo", true);
-    bool writeXdmf = vis_db->getWithDefault<bool>("write_xdmf", false);
-    if (writeSilo) {
-        IO::initialize("", "silo", "false");
-        IO::writeData(timestep, visData, Dm->Comm);
-    }
-    if (writeXdmf) {
-        IO::initialize("", "xdmf", "false");
+    if (vis_db->getWithDefault<bool>("write_silo", true)) {
         IO::writeData(timestep, visData, Dm->Comm);
     }
 
