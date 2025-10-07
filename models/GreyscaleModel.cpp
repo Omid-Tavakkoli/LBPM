@@ -41,7 +41,7 @@ void ScaLBL_GreyscaleModel::ReadParams(string filename) {
     domain_db = db->getDatabase("Domain");
     greyscale_db = db->getDatabase("Greyscale");
     analysis_db = db->getDatabase("Analysis");
-    vis_db = db->getDatabase("Visualization");
+    //vis_db = db->getDatabase("Visualization");
 
     // set defaults
     timestepMax = 100000;
