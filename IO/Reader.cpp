@@ -6,6 +6,9 @@
 #include "common/Utilities.h"
 
 #include <ProfilerApp.h>
+#ifdef USE_SILO
+#include "IO/silo.hpp"
+#endif
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -240,9 +243,9 @@ std::shared_ptr<IO::Mesh> IO::getMesh( const std::string &path, const std::strin
 #ifdef USE_SILO
         const DatabaseEntry &database = meshDatabase.domains[domain];
         std::string filename          = path + "/" + timestep + "/" + database.file;
-        auto fid                      = silo::open( filename, silo::READ );
+        auto fid                      = IO::silo::open( filename, IO::silo::READ );
         if ( meshDatabase.meshClass == "PointList" ) {
-            Array<double> coords = silo::readPointMesh<double>( fid, database.name );
+            Array<double> coords = IO::silo::readPointMesh<double>( fid, database.name );
             ASSERT( coords.size( 1 ) == 3 );
             auto mesh2 = std::make_shared<IO::PointList>( coords.size( 0 ) );
             for ( size_t i = 0; i < coords.size( 1 ); i++ ) {
@@ -254,7 +257,7 @@ std::shared_ptr<IO::Mesh> IO::getMesh( const std::string &path, const std::strin
         } else if ( meshDatabase.meshClass == "TriMesh" || meshDatabase.meshClass == "TriList" ) {
             Array<double> coords;
             Array<int> tri;
-            silo::readTriMesh( fid, database.name, coords, tri );
+            IO::silo::readTriMesh( fid, database.name, coords, tri );
             ASSERT( tri.size( 1 ) == 3 && coords.size( 1 ) == 3 );
             int N_tri   = tri.size( 0 );
             int N_point = coords.size( 0 );
@@ -278,15 +281,15 @@ std::shared_ptr<IO::Mesh> IO::getMesh( const std::string &path, const std::strin
         } else if ( meshDatabase.meshClass == "DomainMesh" ) {
             std::vector<double> range;
             std::vector<int> N;
-            silo::readUniformMesh( fid, database.name, range, N );
-            auto rankinfo = silo::read<int>( fid, database.name + "_rankinfo" );
+            IO::silo::readUniformMesh( fid, database.name, range, N );
+            auto rankinfo = IO::silo::read<int>( fid, database.name + "_rankinfo" );
             RankInfoStruct rank_data( rankinfo[0], rankinfo[1], rankinfo[2], rankinfo[3] );
             mesh = std::make_shared<IO::DomainMesh>( rank_data, N[0], N[1], N[2],
                 range[1] - range[0], range[3] - range[2], range[5] - range[4] );
         } else {
             ERROR( "Unknown mesh class" );
         }
-        silo::close( fid );
+        IO::silo::close( fid );
 #else
         ERROR( "Build without silo support" );
 #endif
@@ -408,18 +411,18 @@ std::shared_ptr<IO::Variable> IO::getVariable( const std::string &path, const st
         const auto &database  = meshDatabase.domains[domain];
         auto variableDatabase = meshDatabase.getVariableDatabase( variable );
         std::string filename  = path + "/" + timestep + "/" + database.file;
-        auto fid              = silo::open( filename, silo::READ );
+        auto fid              = IO::silo::open( filename, IO::silo::READ );
         var = std::make_shared<Variable>( variableDatabase.dim, variableDatabase.type, variable );
         if ( meshDatabase.meshClass == "PointList" ) {
-            var->data = silo::readPointMeshVariable<double>( fid, variable );
+            var->data = IO::silo::readPointMeshVariable<double>( fid, variable );
         } else if ( meshDatabase.meshClass == "TriMesh" || meshDatabase.meshClass == "TriList" ) {
-            var->data = silo::readTriMeshVariable<double>( fid, variable );
+            var->data = IO::silo::readTriMeshVariable<double>( fid, variable );
         } else if ( meshDatabase.meshClass == "DomainMesh" ) {
-            var->data = silo::readUniformMeshVariable<double>( fid, variable );
+            var->data = IO::silo::readUniformMeshVariable<double>( fid, variable );
         } else {
             ERROR( "Unknown mesh class" );
         }
-        silo::close( fid );
+        IO::silo::close( fid );
 #else
         ERROR( "Build without silo support" );
 #endif
