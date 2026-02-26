@@ -723,15 +723,23 @@ void ScaLBL_GreyscaleModel::Run() {
                 kmax = Nz - 1 - Dm->outlet_layers_z;
 
             vax_loc = vay_loc = vaz_loc = 0.f;
-            for (int k = kmin; k < kmax; k++) {
+            //for (int k = kmin; k < kmax; k++) {
+            int kmin_eff = kmin + 3;
+            int kmax_eff = kmax - 3;
+            if (kmin_eff < 1) kmin_eff = 1;
+            if (kmax_eff > Nz - 1) kmax_eff = Nz - 1;
+            for (int k = kmin_eff; k < kmax_eff; k++) {
                 for (int j = jmin; j < Ny - 1; j++) {
                     for (int i = imin; i < Nx - 1; i++) {
-                        if (SignDist(i, j, k) > 0) {
-                            vax_loc += Velocity_x(i, j, k);
-                            vay_loc += Velocity_y(i, j, k);
-                            vaz_loc += Velocity_z(i, j, k);
-                            count_loc += 1.0;
-                        }
+                        //if (SignDist(i, j, k) > 0) {
+                            //vax_loc += Velocity_x(i, j, k);
+                            //vay_loc += Velocity_y(i, j, k);
+                            //vaz_loc += Velocity_z(i, j, k);
+                        //}
+                        vax_loc += Velocity_x(i, j, k);
+                        vay_loc += Velocity_y(i, j, k);
+                        vaz_loc += Velocity_z(i, j, k);
+                        count_loc += 1.0;
                     }
                 }
             }
@@ -755,9 +763,11 @@ void ScaLBL_GreyscaleModel::Run() {
                 dir_z = 1.0;
                 force_mag = 1.0;
             }
+            //double gradP = fabs(Fx*dir_x + Fy*dir_y + Fz*dir_z);
+            double gradP = sqrt(Fx*Fx+Fy*Fy+Fz*Fz)+(din-dout)/((Nz-2)*nprocz)/3;
             //double flow_rate = (px*dir_x + py*dir_y + pz*dir_z)/mass_glb;
-            double flow_rate = (vax * dir_x + vay * dir_y + vaz * dir_z);
-
+            //double flow_rate = (vax * dir_x + vay * dir_y + vaz * dir_z);
+            double flow_rate = sqrt(vax*vax+vay*vay+vaz*vaz);
             error = fabs(flow_rate - flow_rate_previous) / fabs(flow_rate);
             flow_rate_previous = flow_rate;
 
@@ -776,10 +786,11 @@ void ScaLBL_GreyscaleModel::Run() {
 
             double h = Dm->voxel_length;
             //double absperm = h*h*mu*Mask->Porosity()*flow_rate / force_mag;
-            double absperm = h * h * mu * GreyPorosity * flow_rate / force_mag;
+            //double absperm = h * h * mu * GreyPorosity * flow_rate / force_mag;
+            double absperm = h * h * mu * flow_rate / gradP;
 
             if (rank == 0) {
-                printf("     AbsPerm = %.5g [micron^2]\n", absperm);
+                printf("     AbsPerm = %.5g [micron^2], flow_rate = %.6g, gradP = %.6g\n", absperm, flow_rate, gradP);
                 bool WriteHeader = false;
                 FILE *log_file = fopen("Permeability.csv", "r");
                 if (log_file != NULL)
@@ -789,13 +800,13 @@ void ScaLBL_GreyscaleModel::Run() {
                 log_file = fopen("Permeability.csv", "a");
                 if (WriteHeader)
                     fprintf(log_file, "timestep Fx Fy Fz mu Vs As Hs Xs vax "
-                                      "vay vaz AbsPerm \n");
+                                      "vay vaz AbsPerm FlowRate GradP\n");
 
                 fprintf(log_file,
                         "%i %.8g %.8g %.8g %.8g %.8g %.8g %.8g %.8g %.8g %.8g "
-                        "%.8g %.8g\n",
+                        "%.8g %.8g %.8g %.8g\n",
                         timestep, Fx, Fy, Fz, mu, h * h * h * Vs, h * h * As,
-                        h * Hs, Xs, vax, vay, vaz, absperm);
+                        h * Hs, Xs, vax, vay, vaz, absperm, flow_rate, gradP);
                 fclose(log_file);
             }
         }

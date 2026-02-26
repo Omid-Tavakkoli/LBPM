@@ -1546,11 +1546,99 @@ void ScaLBL_GreyscaleColorModel::WriteVisFiles() {
         IO::writeData(timestep, visData, Dm->Comm);
     }
 
-    if (vis_db->getWithDefault<bool>("save_8bit_raw", true)) {
-        //TODO
-        //char CurrentIDFilename[40];
-        //sprintf(CurrentIDFilename,"id_t%d.raw",timestep);
-        //Averages.AggregateLabels(CurrentIDFilename);
+    if (vis_db->getWithDefault<bool>("save_32bit_raw", true)) {
+        // Save raw outputs for visualization
+        // - Per timestep: phase field as float32 in [-1,1] (solids set to 2.0)
+
+        // Local interior sizes
+        int nx = Dm->Nx;
+        int ny = Dm->Ny;
+        int nz = Dm->Nz;
+        int npx = Dm->nprocx();
+        int npy = Dm->nprocy();
+        int npz = Dm->nprocz();
+        int full_nx = npx * (nx - 2);
+        int full_ny = npy * (ny - 2);
+        int full_nz = npz * (nz - 2);
+        int local_size = (nx - 2) * (ny - 2) * (nz - 2);
+        long int full_size = long(full_nx) * long(full_ny) * long(full_nz);
+
+        // Build local float32 buffer for phase
+        float *LocalPhaseF32 = new float[local_size];
+
+        // Copy Phi to host and fill LocalPhaseF32 (solids set to 0.0)
+        ScaLBL_CopyToHost(DataTemp.data(), Phi, sizeof(double) * nx * ny * nz);
+        for (int k = 1; k < nz - 1; k++) {
+            for (int j = 1; j < ny - 1; j++) {
+                for (int i = 1; i < nx - 1; i++) {
+                    int n = k * nx * ny + j * nx + i;
+                    int n_local = (k - 1) * (nx - 2) * (ny - 2) + (j - 1) * (nx - 2) + (i - 1);
+                    signed char label = Mask->id[n];
+                    if (label <= 0) {
+                        LocalPhaseF32[n_local] = 2.0f; // solid sentinel outside [-1,1]
+                    } else {
+                        double v = DataTemp(i, j, k);
+                        if (v < -1.0)
+                            v = -1.0;
+                        if (v > 1.0)
+                            v = 1.0;
+                        LocalPhaseF32[n_local] = (float)v;
+                    }
+                }
+            }
+        }
+        Dm->Comm.barrier();
+
+        // Aggregate and write phase_t<timestep>.raw as float32
+        if (Dm->Comm.getRank() == 0) {
+            float *FullPhaseF32 = new float[full_size];
+            // First copy local rank 0 block
+            for (int k = 1; k < nz - 1; k++) {
+                for (int j = 1; j < ny - 1; j++) {
+                    for (int i = 1; i < nx - 1; i++) {
+                        int x = i - 1;
+                        int y = j - 1;
+                        int z = k - 1;
+                        int n_local = (k - 1) * (nx - 2) * (ny - 2) + (j - 1) * (nx - 2) + (i - 1);
+                        long int n_full = long(z) * long(full_nx) * long(full_ny) + long(y) * long(full_nx) + long(x);
+                        FullPhaseF32[n_full] = LocalPhaseF32[n_local];
+                    }
+                }
+            }
+            // Recv other ranks' local blocks and place into full volume
+            for (int rnk = 1; rnk < npx * npy * npz; rnk++) {
+                int ipz = rnk / (npx * npy);
+                int ipy = (rnk - ipz * npx * npy) / npx;
+                int ipx = (rnk - ipz * npx * npy - ipy * npx);
+                int tag = 1550 + rnk;
+                std::vector<float> LocalBuf(local_size);
+                Dm->Comm.recv(LocalBuf.data(), local_size, rnk, tag);
+                for (int k = 1; k < nz - 1; k++) {
+                    for (int j = 1; j < ny - 1; j++) {
+                        for (int i = 1; i < nx - 1; i++) {
+                            int x = i - 1 + ipx * (nx - 2);
+                            int y = j - 1 + ipy * (ny - 2);
+                            int z = k - 1 + ipz * (nz - 2);
+                            int n_local = (k - 1) * (nx - 2) * (ny - 2) + (j - 1) * (nx - 2) + (i - 1);
+                            long int n_full = long(z) * long(full_nx) * long(full_ny) + long(y) * long(full_nx) + long(x);
+                            FullPhaseF32[n_full] = LocalBuf[n_local];
+                        }
+                    }
+                }
+            }
+            char PhaseName[64];
+            sprintf(PhaseName, "phase_t%d.raw", timestep);
+            FILE *OUTFILE = fopen(PhaseName, "wb");
+            fwrite(FullPhaseF32, 4, full_size, OUTFILE);
+            fclose(OUTFILE);
+            delete[] FullPhaseF32;
+        } else {
+            int tag = 1550 + Dm->Comm.getRank();
+            int dstrank = 0;
+            Dm->Comm.send(LocalPhaseF32, local_size, dstrank, tag);
+        }
+        delete[] LocalPhaseF32;
+        Dm->Comm.barrier();
     }
 }
 

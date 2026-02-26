@@ -68,9 +68,10 @@ __global__ void dvc_ScaLBL_D3Q19_AAeven_Greyscale(double *dist, int start, int f
 
         c0 = 0.5*(1.0+porosity*0.5*mu_eff/perm);
         if (porosity==1.0) c0 = 0.5;//i.e. apparent pore nodes
-        GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+        //GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+		GeoFun = 0.0;
         c1 = porosity*0.5*GeoFun/sqrt(perm);
-        if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
+        //if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
 
 		rho = f0+f2+f1+f4+f3+f6+f5+f8+f7+f10+f9+f12+f11+f14+f13+f16+f15+f18+f17;
         pressure = rho/porosity/3.0;
@@ -375,9 +376,10 @@ __global__ void dvc_ScaLBL_D3Q19_AAodd_Greyscale(int *neighborList, double *dist
 
         c0 = 0.5*(1.0+porosity*0.5*mu_eff/perm);
         if (porosity==1.0) c0 = 0.5;//i.e. apparent pore nodes
-        GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+        //GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+        GeoFun = 0.0;
         c1 = porosity*0.5*GeoFun/sqrt(perm);
-        if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
+        //if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
 
 		rho = f0+f2+f1+f4+f3+f6+f5+f8+f7+f10+f9+f12+f11+f14+f13+f16+f15+f18+f17;
         pressure = rho/porosity/3.0;
@@ -901,9 +903,10 @@ __global__ void dvc_ScaLBL_D3Q19_AAeven_Greyscale_IMRT(double *dist, int start, 
 
             c0 = 0.5*(1.0+porosity*0.5*mu_eff/perm);
             if (porosity==1.0) c0 = 0.5;//i.e. apparent pore nodes
-            GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+            //GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+            GeoFun = 0.0;
             c1 = porosity*0.5*GeoFun/sqrt(perm);
-            if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
+            //if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
 
             vx = jx/Den+0.5*porosity*Gx;
             vy = jy/Den+0.5*porosity*Gy;
@@ -1414,9 +1417,10 @@ __global__ void dvc_ScaLBL_D3Q19_AAodd_Greyscale_IMRT(int *neighborList, double 
 
             c0 = 0.5*(1.0+porosity*0.5*mu_eff/perm);
             if (porosity==1.0) c0 = 0.5;//i.e. apparent pore nodes
-            GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+            //GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+            GeoFun = 0.0;
             c1 = porosity*0.5*GeoFun/sqrt(perm);
-            if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
+            //if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
 
             vx = jx/Den+0.5*porosity*Gx;
             vy = jy/Den+0.5*porosity*Gy;
@@ -1982,9 +1986,10 @@ __global__ void dvc_ScaLBL_D3Q19_AAodd_Greyscale_MRT(int *neighborList, double *
 
             c0 = 0.5*(1.0+porosity*0.5*mu_eff/perm);
             if (porosity==1.0) c0 = 0.5;//i.e. apparent pore nodes
-            GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+            //GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+            GeoFun = 0.0;
             c1 = porosity*0.5*GeoFun/sqrt(perm);
-            if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
+            //if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
 
             vx = jx/rho0+0.5*porosity*Gx;
             vy = jy/rho0+0.5*porosity*Gy;
@@ -2489,9 +2494,10 @@ __global__ void dvc_ScaLBL_D3Q19_AAeven_Greyscale_MRT(double *dist, int start, i
 
             c0 = 0.5*(1.0+porosity*0.5*mu_eff/perm);
             if (porosity==1.0) c0 = 0.5;//i.e. apparent pore nodes
-            GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+            //GeoFun = 1.75/sqrt(150.0*porosity*porosity*porosity);
+            GeoFun = 0.0;
             c1 = porosity*0.5*GeoFun/sqrt(perm);
-            if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
+            //if (porosity==1.0) c1 = 0.0;//i.e. apparent pore nodes
 
             vx = jx/rho0+0.5*porosity*Gx;
             vy = jy/rho0+0.5*porosity*Gy;
