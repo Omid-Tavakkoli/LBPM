@@ -495,9 +495,13 @@ void ScaLBL_GreyscaleModel::Initialize() {
         double *cfq;
         cfq = new double[19 * Np];
         ifstream File(LocalRestartFile, ios::binary);
-        for (int n = 0; n < Np; n++) {
+        // NOTE: loop order must match the write order in Run() (q outer, n inner),
+        // since the restart file is a raw dump of fq[q*Np+n] written contiguously.
+        // Reading with (n outer, q inner) transposes every value onto the wrong
+        // node/direction and corrupts the reloaded distributions.
+        for (int q = 0; q < 19; q++) {
             // Read the distributions
-            for (int q = 0; q < 19; q++) {
+            for (int n = 0; n < Np; n++) {
                 File.read((char *)&value, sizeof(value));
                 cfq[q * Np + n] = value;
             }
