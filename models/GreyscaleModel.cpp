@@ -297,7 +297,7 @@ void ScaLBL_GreyscaleModel::AssignComponentLabels(double *Porosity,
     for (unsigned int idx = 0; idx < NLABELS; idx++) {
         double volume_fraction =
             double(label_count_global[idx]) /
-            double((Nx - 2) * (Ny - 2) * (Nz - 2) * nprocs);
+            (double(Nx - 2) * (Ny - 2) * (Nz - 2) * nprocs);
         GreyPorosity += volume_fraction * PorosityList[idx];
     }
 
@@ -310,7 +310,7 @@ void ScaLBL_GreyscaleModel::AssignComponentLabels(double *Porosity,
             PERMEABILITY = PermeabilityList[idx];
             double volume_fraction =
                 double(label_count_global[idx]) /
-                double((Nx - 2) * (Ny - 2) * (Nz - 2) * nprocs);
+                (double(Nx - 2) * (Ny - 2) * (Nz - 2) * nprocs);
             printf("   label=%d: porosity=%.3g, permeability=%.3g [um^2] "
                    "(=%.3g [voxel^2]), volume fraction=%.3g\n",
                    VALUE, POROSITY, PERMEABILITY,
@@ -369,7 +369,7 @@ void ScaLBL_GreyscaleModel::AssignComponentLabels(
     }
     GreyPorosity = Dm->Comm.sumReduce(GreyPorosity_loc);
     GreyPorosity =
-        GreyPorosity / double((Nx - 2) * (Ny - 2) * (Nz - 2) * nprocs);
+        GreyPorosity / (double(Nx - 2) * (Ny - 2) * (Nz - 2) * nprocs);
 
     if (rank == 0) {
         printf("Image resolution: %.5g [um/voxel]\n", Dm->voxel_length);
