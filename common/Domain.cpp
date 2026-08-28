@@ -1821,6 +1821,8 @@ void Domain::ReadFromFile(const std::string &Filename,
         //printf("Ready to recieve data %i at process %i \n", N,rank);
         Comm.recv(UserData, N, 0, 15);
     }
+    delete[] loc_id;
+    delete[] SegData; // NULL on all ranks except 0; delete[] on NULL is a no-op
     Comm.barrier();
 }
 
