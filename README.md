@@ -3,6 +3,8 @@ LBPM
 
 Lattice Boltzmann Methods for Porous Media
 
+This repository is based on [LBPM](https://github.com/OPM/LBPM), with the greyscale solver modified for flow in heterogeneous porous media.
+
 ========
 
 Notes on installation
