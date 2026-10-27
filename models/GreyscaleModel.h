@@ -46,8 +46,17 @@ public:
     void Run();
     void WriteDebug();
     void VelocityField();
+    void WriteVelocityProfile();
+    void ReportGreyscaleField(const double *Poros, const double *Perm);
+    void SmoothPorosityField(double *Poros, int passes);
+    void ComputeViscosityGradient(const double *Poros, double *GradHost);
 
     bool Restart, pBC;
+    bool tau_eff_defaulted;
+    bool Forchheimer;            //include the Forchheimer inertial drag
+    double tau_porosity_min;     //lower bound on eps in the local tau(x)
+    int tau_smoothing_passes;    //3^3 box-mean passes applied to eps for tau(x)
+    bool write_velocity_profile; //dump ubar_z(y) at convergence
     int timestep, timestepMax;
     int BoundaryCondition;
     int CollisionType;
@@ -80,6 +89,7 @@ public:
     double *fq;
     double *Permeability; //grey voxel permeability
     double *Porosity;
+    double *GradNuLat; //grad(nu_e/eps), 3*Np, for the viscous correction
     double *Velocity;
     double *Pressure_dvc;
     IntArray Map;

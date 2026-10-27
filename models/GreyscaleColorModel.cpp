@@ -1120,6 +1120,28 @@ void ScaLBL_GreyscaleColorModel::Run() {
             ScaLBL_Comm->RegularLayout(Map, &Velocity[2 * Np], Averages->Vel_z);
 
             Averages->Basic();
+
+            /* Progress report. The run is otherwise completely silent between
+             * the header and the final summary for every boundary condition
+             * except the flux one, which makes a long run indistinguishable
+             * from a hung one. The saturation is printed as well: in a closed
+             * system it must stay constant, so a drift here is a mass
+             * conservation failure rather than physics. */
+            if (rank == 0) {
+                double elapsed = std::chrono::duration<double>(
+                                     std::chrono::system_clock::now() - t1)
+                                     .count();
+                double frac = double(timestep) / double(timestepMax);
+                double rate = (elapsed > 0.0) ? double(Np) * double(timestep) /
+                                                    elapsed / 1.0e6
+                                              : 0.0;
+                double eta = (frac > 0.0) ? elapsed * (1.0 / frac - 1.0) : 0.0;
+                printf("timestep %8i / %i (%5.1f%%)  sat %.6f  "
+                       "elapsed %6.0f s  eta %6.0f s  %5.2f MLUPS/core\n",
+                       timestep, timestepMax, 100.0 * frac,
+                       Averages->saturation, elapsed, eta, rate);
+                fflush(stdout);
+            }
         }
 
         // allow initial ramp-up to get closer to steady state

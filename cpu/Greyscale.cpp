@@ -16,11 +16,45 @@
 */
 #include <math.h>
 
+// Lower bound on the porosity used in the local relaxation time
+//   tau(x) = 1/2 + 3*nu_e/eps(x)
+// Below this the scaling is capped rather than allowed to diverge.
+#define GREY_TAU_POROSITY_MIN 0.05
+// 1 = local relaxation time tau(x) (change B); 0 = uniform tau (A only)
+#define GREY_LOCAL_TAU 1
+
+
+// Runtime switch for the Forchheimer (inertial) drag. Scaling GeoFun to zero
+// removes it from both the velocity closure (c1) and the drag force, leaving a
+// purely linear Darcy-Brinkman problem. Set from the input file at start-up.
+static double GreyForchheimerScale = 1.0;
+
+
+extern "C" void ScaLBL_D3Q19_Greyscale_SetForchheimer(int on) {
+    GreyForchheimerScale = on ? 1.0 : 0.0;
+}
+
+static double GreyTauPorosityMin = GREY_TAU_POROSITY_MIN;
+
+extern "C" void ScaLBL_D3Q19_Greyscale_SetTauPorosityMin(double value) {
+    // A value of zero or less disables the floor: tau is then set from the true
+    // porosity of every voxel. A tiny positive bound is retained so that a
+    // voxel with zero porosity cannot divide by zero.
+    GreyTauPorosityMin = value > 1.0e-12 ? value : 1.0e-12;
+}
+
+extern "C" void ScaLBL_D3Q19_Greyscale_Config(int *local_tau) {
+    *local_tau = GREY_LOCAL_TAU;
+}
+
+
+
+
 extern "C" void
 ScaLBL_D3Q19_AAeven_Greyscale(double *dist, int start, int finish, int Np,
                               double rlx, double rlx_eff, double Gx, double Gy,
                               double Gz, double *Poros, double *Perm,
-                              double *Velocity, double *Pressure) {
+                              double *Velocity, double *Pressure, double *GradNu) {
     // conserved momemnts
     double rho, vx, vy, vz, v_mag;
     double ux, uy, uz, u_mag;
@@ -34,6 +68,7 @@ ScaLBL_D3Q19_AAeven_Greyscale(double *dist, int start, int finish, int Np,
     double perm;                                 //voxel permeability
     double c0, c1;                               //Guo's model parameters
     double mu_eff = (1.0 / rlx_eff - 0.5) / 3.0; //kinematic viscosity
+    double nu_e = (1.0 / rlx - 0.5) / 3.0; //target effective viscosity
     double Fx, Fy,
         Fz; //The total body force including Brinkman force and user-specified (Gx,Gy,Gz)
 
@@ -60,25 +95,30 @@ ScaLBL_D3Q19_AAeven_Greyscale(double *dist, int start, int finish, int Np,
         f18 = dist[17 * Np + n];
 
         porosity = Poros[n];
+        #if GREY_LOCAL_TAU
+        //local relaxation time: tau(x) = 1/2 + 3*nu_e/eps(x)
+        double eps_t = porosity > GreyTauPorosityMin ? porosity : GreyTauPorosityMin;
+        rlx = 1.0 / (0.5 + 3.0 * nu_e / eps_t);
+        #endif
         perm = Perm[n];
 
-        c0 = 0.5 * (1.0 + porosity * 0.5 * mu_eff / perm);
+        c0 = 0.5 * (1.0 + 0.5 * mu_eff / perm);
         if (porosity == 1.0)
             c0 = 0.5; //i.e. apparent pore nodes
-        GeoFun = 1.75 / sqrt(150.0 * porosity * porosity * porosity);
-        c1 = porosity * 0.5 * GeoFun / sqrt(perm);
+        GeoFun = GreyForchheimerScale * 1.75 / sqrt(150.0 * porosity * porosity * porosity);
+        c1 = 0.5 * GeoFun / sqrt(perm);
         if (porosity == 1.0)
             c1 = 0.0; //i.e. apparent pore nodes
 
         rho = f0 + f2 + f1 + f4 + f3 + f6 + f5 + f8 + f7 + f10 + f9 + f12 +
               f11 + f14 + f13 + f16 + f15 + f18 + f17;
-        pressure = rho / porosity / 3.0;
+        pressure = rho / 3.0;
         vx = (f1 - f2 + f7 - f8 + f9 - f10 + f11 - f12 + f13 - f14) / rho +
-             0.5 * porosity * Gx;
+             0.5 * Gx;
         vy = (f3 - f4 + f7 - f8 - f9 + f10 + f15 - f16 + f17 - f18) / rho +
-             0.5 * porosity * Gy;
+             0.5 * Gy;
         vz = (f5 - f6 + f11 - f12 - f13 + f14 + f15 - f16 - f17 + f18) / rho +
-             0.5 * porosity * Gz;
+             0.5 * Gz;
         v_mag = sqrt(vx * vx + vy * vy + vz * vz);
         ux = vx / (c0 + sqrt(c0 * c0 + c1 * v_mag));
         uy = vy / (c0 + sqrt(c0 * c0 + c1 * v_mag));
@@ -86,17 +126,49 @@ ScaLBL_D3Q19_AAeven_Greyscale(double *dist, int start, int finish, int Np,
         u_mag = sqrt(ux * ux + uy * uy + uz * uz);
 
         //Update the total force to include linear (Darcy) and nonlinear (Forchheimer) drags due to the porous medium
-        Fx = -porosity * mu_eff / perm * ux -
-             porosity * GeoFun / sqrt(perm) * u_mag * ux + porosity * Gx;
-        Fy = -porosity * mu_eff / perm * uy -
-             porosity * GeoFun / sqrt(perm) * u_mag * uy + porosity * Gy;
-        Fz = -porosity * mu_eff / perm * uz -
-             porosity * GeoFun / sqrt(perm) * u_mag * uz + porosity * Gz;
+        Fx = -mu_eff / perm * ux -
+             GeoFun / sqrt(perm) * u_mag * ux + Gx;
+        Fy = -mu_eff / perm * uy -
+             GeoFun / sqrt(perm) * u_mag * uy + Gy;
+        Fz = -mu_eff / perm * uz -
+             GeoFun / sqrt(perm) * u_mag * uz + Gz;
         if (porosity == 1.0) {
             Fx = Gx;
             Fy = Gy;
             Fz = Gz;
         }
+        // Remove the excess of the divergence form over the Laplacian form of the
+        // viscous term, 2 S_ij d_j(nu_lat). The non-equilibrium second moments are
+        // assembled from the populations directly: the equilibrium contributes
+        // rho*c_s^2*delta_ij + rho*u_i*u_j/eps, whose isotropic part cancels in the
+        // deviatoric combinations below. The force here is an acceleration, so no
+        // density factor is applied.
+        {
+            double dnx = GradNu[n];
+            double dny = GradNu[Np + n];
+            double dnz = GradNu[2 * Np + n];
+            if (dnx != 0.0 || dny != 0.0 || dnz != 0.0) {
+                double ei = 1.0 / porosity;
+                double Pxx = f1 + f2 + f7 + f8 + f9 + f10 + f11 + f12 + f13 + f14;
+                double Pyy = f3 + f4 + f7 + f8 + f9 + f10 + f15 + f16 + f17 + f18;
+                double Pzz = f5 + f6 + f11 + f12 + f13 + f14 + f15 + f16 + f17 + f18;
+                double q9 = (2.0 * Pxx - Pyy - Pzz) -
+                            (2.0 * ux * ux - uy * uy - uz * uz) * rho * ei;
+                double q11 = (Pyy - Pzz) - (uy * uy - uz * uz) * rho * ei;
+                double q13 = (f7 + f8 - f9 - f10) - ux * uy * rho * ei;
+                double q14 = (f15 + f16 - f17 - f18) - uy * uz * rho * ei;
+                double q15 = (f11 + f12 - f13 - f14) - ux * uz * rho * ei;
+                double cS = -1.5 * rlx / rho;
+                double Sxx = cS * (q9 / 3.0);
+                double Syy = cS * (0.5 * (q11 - q9 / 3.0));
+                double Szz = -Sxx - Syy;
+                double Sxy = cS * q13, Syz = cS * q14, Sxz = cS * q15;
+                Fx -= 2.0 * (Sxx * dnx + Sxy * dny + Sxz * dnz);
+                Fy -= 2.0 * (Sxy * dnx + Syy * dny + Syz * dnz);
+                Fz -= 2.0 * (Sxz * dnx + Syz * dny + Szz * dnz);
+            }
+        }
+
 
         //------------------------ BGK collison where body force has higher-order terms ----------------------------------------------------------//
         //		// q=0
@@ -370,7 +442,7 @@ extern "C" void
 ScaLBL_D3Q19_AAodd_Greyscale(int *neighborList, double *dist, int start,
                              int finish, int Np, double rlx, double rlx_eff,
                              double Gx, double Gy, double Gz, double *Poros,
-                             double *Perm, double *Velocity, double *Pressure) {
+                             double *Perm, double *Velocity, double *Pressure, double *GradNu) {
     // conserved momemnts
     double rho, vx, vy, vz, v_mag;
     double ux, uy, uz, u_mag;
@@ -386,6 +458,7 @@ ScaLBL_D3Q19_AAodd_Greyscale(int *neighborList, double *dist, int start,
     double perm;                                 //voxel permeability
     double c0, c1;                               //Guo's model parameters
     double mu_eff = (1.0 / rlx_eff - 0.5) / 3.0; //kinematic viscosity
+    double nu_e = (1.0 / rlx - 0.5) / 3.0; //target effective viscosity
     double Fx, Fy,
         Fz; //The total body force including Brinkman force and user-specified (Gx,Gy,Gz)
 
@@ -466,25 +539,30 @@ ScaLBL_D3Q19_AAodd_Greyscale(int *neighborList, double *dist, int start,
         f18 = dist[nr18];
 
         porosity = Poros[n];
+        #if GREY_LOCAL_TAU
+        //local relaxation time: tau(x) = 1/2 + 3*nu_e/eps(x)
+        double eps_t = porosity > GreyTauPorosityMin ? porosity : GreyTauPorosityMin;
+        rlx = 1.0 / (0.5 + 3.0 * nu_e / eps_t);
+        #endif
         perm = Perm[n];
 
-        c0 = 0.5 * (1.0 + porosity * 0.5 * mu_eff / perm);
+        c0 = 0.5 * (1.0 + 0.5 * mu_eff / perm);
         if (porosity == 1.0)
             c0 = 0.5; //i.e. apparent pore nodes
-        GeoFun = 1.75 / sqrt(150.0 * porosity * porosity * porosity);
-        c1 = porosity * 0.5 * GeoFun / sqrt(perm);
+        GeoFun = GreyForchheimerScale * 1.75 / sqrt(150.0 * porosity * porosity * porosity);
+        c1 = 0.5 * GeoFun / sqrt(perm);
         if (porosity == 1.0)
             c1 = 0.0; //i.e. apparent pore nodes
 
         rho = f0 + f2 + f1 + f4 + f3 + f6 + f5 + f8 + f7 + f10 + f9 + f12 +
               f11 + f14 + f13 + f16 + f15 + f18 + f17;
-        pressure = rho / porosity / 3.0;
+        pressure = rho / 3.0;
         vx = (f1 - f2 + f7 - f8 + f9 - f10 + f11 - f12 + f13 - f14) / rho +
-             0.5 * porosity * Gx;
+             0.5 * Gx;
         vy = (f3 - f4 + f7 - f8 - f9 + f10 + f15 - f16 + f17 - f18) / rho +
-             0.5 * porosity * Gy;
+             0.5 * Gy;
         vz = (f5 - f6 + f11 - f12 - f13 + f14 + f15 - f16 - f17 + f18) / rho +
-             0.5 * porosity * Gz;
+             0.5 * Gz;
         v_mag = sqrt(vx * vx + vy * vy + vz * vz);
         ux = vx / (c0 + sqrt(c0 * c0 + c1 * v_mag));
         uy = vy / (c0 + sqrt(c0 * c0 + c1 * v_mag));
@@ -492,17 +570,49 @@ ScaLBL_D3Q19_AAodd_Greyscale(int *neighborList, double *dist, int start,
         u_mag = sqrt(ux * ux + uy * uy + uz * uz);
 
         //Update the total force to include linear (Darcy) and nonlinear (Forchheimer) drags due to the porous medium
-        Fx = -porosity * mu_eff / perm * ux -
-             porosity * GeoFun / sqrt(perm) * u_mag * ux + porosity * Gx;
-        Fy = -porosity * mu_eff / perm * uy -
-             porosity * GeoFun / sqrt(perm) * u_mag * uy + porosity * Gy;
-        Fz = -porosity * mu_eff / perm * uz -
-             porosity * GeoFun / sqrt(perm) * u_mag * uz + porosity * Gz;
+        Fx = -mu_eff / perm * ux -
+             GeoFun / sqrt(perm) * u_mag * ux + Gx;
+        Fy = -mu_eff / perm * uy -
+             GeoFun / sqrt(perm) * u_mag * uy + Gy;
+        Fz = -mu_eff / perm * uz -
+             GeoFun / sqrt(perm) * u_mag * uz + Gz;
         if (porosity == 1.0) {
             Fx = Gx;
             Fy = Gy;
             Fz = Gz;
         }
+        // Remove the excess of the divergence form over the Laplacian form of the
+        // viscous term, 2 S_ij d_j(nu_lat). The non-equilibrium second moments are
+        // assembled from the populations directly: the equilibrium contributes
+        // rho*c_s^2*delta_ij + rho*u_i*u_j/eps, whose isotropic part cancels in the
+        // deviatoric combinations below. The force here is an acceleration, so no
+        // density factor is applied.
+        {
+            double dnx = GradNu[n];
+            double dny = GradNu[Np + n];
+            double dnz = GradNu[2 * Np + n];
+            if (dnx != 0.0 || dny != 0.0 || dnz != 0.0) {
+                double ei = 1.0 / porosity;
+                double Pxx = f1 + f2 + f7 + f8 + f9 + f10 + f11 + f12 + f13 + f14;
+                double Pyy = f3 + f4 + f7 + f8 + f9 + f10 + f15 + f16 + f17 + f18;
+                double Pzz = f5 + f6 + f11 + f12 + f13 + f14 + f15 + f16 + f17 + f18;
+                double q9 = (2.0 * Pxx - Pyy - Pzz) -
+                            (2.0 * ux * ux - uy * uy - uz * uz) * rho * ei;
+                double q11 = (Pyy - Pzz) - (uy * uy - uz * uz) * rho * ei;
+                double q13 = (f7 + f8 - f9 - f10) - ux * uy * rho * ei;
+                double q14 = (f15 + f16 - f17 - f18) - uy * uz * rho * ei;
+                double q15 = (f11 + f12 - f13 - f14) - ux * uz * rho * ei;
+                double cS = -1.5 * rlx / rho;
+                double Sxx = cS * (q9 / 3.0);
+                double Syy = cS * (0.5 * (q11 - q9 / 3.0));
+                double Szz = -Sxx - Syy;
+                double Sxy = cS * q13, Syz = cS * q14, Sxz = cS * q15;
+                Fx -= 2.0 * (Sxx * dnx + Sxy * dny + Sxz * dnz);
+                Fy -= 2.0 * (Sxy * dnx + Syy * dny + Syz * dnz);
+                Fz -= 2.0 * (Sxz * dnx + Syz * dny + Szz * dnz);
+            }
+        }
+
 
         //------------------------ BGK collison where body force has higher-order terms ----------------------------------------------------------//
         //		// q=0
@@ -763,7 +873,7 @@ ScaLBL_D3Q19_AAodd_Greyscale(int *neighborList, double *dist, int start,
 extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
     double *dist, int start, int finish, int Np, double rlx, double rlx_eff,
     double Gx, double Gy, double Gz, double *Poros, double *Perm,
-    double *Velocity, double Den, double *Pressure) {
+    double *Velocity, double Den, double *Pressure, double *GradNu) {
     double vx, vy, vz, v_mag;
     double ux, uy, uz, u_mag;
     double pressure; //defined for this incompressible model
@@ -778,6 +888,7 @@ extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
     double perm;                                 //voxel permeability
     double c0, c1;                               //Guo's model parameters
     double mu_eff = (1.0 / rlx_eff - 0.5) / 3.0; //kinematic viscosity
+    double nu_e = (1.0 / rlx - 0.5) / 3.0; //target effective viscosity
     double Fx, Fy,
         Fz; //The total body force including Brinkman force and user-specified (Gx,Gy,Gz)
     double rlx_setA = rlx;
@@ -1073,19 +1184,25 @@ extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
         //---------------------------------------------------------------------//
 
         porosity = Poros[n];
+        #if GREY_LOCAL_TAU
+        //local relaxation time: tau(x) = 1/2 + 3*nu_e/eps(x)
+        double eps_t = porosity > GreyTauPorosityMin ? porosity : GreyTauPorosityMin;
+        rlx_setA = 1.0 / (0.5 + 3.0 * nu_e / eps_t);
+        rlx_setB = 8.f * (2.f - rlx_setA) / (8.f - rlx_setA);
+        #endif
         perm = Perm[n];
 
-        c0 = 0.5 * (1.0 + porosity * 0.5 * mu_eff / perm);
+        c0 = 0.5 * (1.0 + 0.5 * mu_eff / perm);
         if (porosity == 1.0)
             c0 = 0.5; //i.e. apparent pore nodes
-        GeoFun = 1.75 / sqrt(150.0 * porosity * porosity * porosity);
-        c1 = porosity * 0.5 * GeoFun / sqrt(perm);
+        GeoFun = GreyForchheimerScale * 1.75 / sqrt(150.0 * porosity * porosity * porosity);
+        c1 = 0.5 * GeoFun / sqrt(perm);
         if (porosity == 1.0)
             c1 = 0.0; //i.e. apparent pore nodes
 
-        vx = jx / Den + 0.5 * porosity * Gx;
-        vy = jy / Den + 0.5 * porosity * Gy;
-        vz = jz / Den + 0.5 * porosity * Gz;
+        vx = jx / Den + 0.5 * Gx;
+        vy = jy / Den + 0.5 * Gy;
+        vz = jz / Den + 0.5 * Gz;
         v_mag = sqrt(vx * vx + vy * vy + vz * vz);
         ux = vx / (c0 + sqrt(c0 * c0 + c1 * v_mag));
         uy = vy / (c0 + sqrt(c0 * c0 + c1 * v_mag));
@@ -1094,29 +1211,56 @@ extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
 
         //Update the total force to include linear (Darcy) and nonlinear (Forchheimer) drags due to the porous medium
         Fx =
-            Den * (-porosity * mu_eff / perm * ux -
-                   porosity * GeoFun / sqrt(perm) * u_mag * ux + porosity * Gx);
+            Den * (-mu_eff / perm * ux -
+                   GeoFun / sqrt(perm) * u_mag * ux + Gx);
         Fy =
-            Den * (-porosity * mu_eff / perm * uy -
-                   porosity * GeoFun / sqrt(perm) * u_mag * uy + porosity * Gy);
+            Den * (-mu_eff / perm * uy -
+                   GeoFun / sqrt(perm) * u_mag * uy + Gy);
         Fz =
-            Den * (-porosity * mu_eff / perm * uz -
-                   porosity * GeoFun / sqrt(perm) * u_mag * uz + porosity * Gz);
+            Den * (-mu_eff / perm * uz -
+                   GeoFun / sqrt(perm) * u_mag * uz + Gz);
         if (porosity == 1.0) {
             Fx = Den * Gx;
             Fy = Den * Gy;
             Fz = Den * Gz;
         }
+        // Remove the excess of the divergence form over the Laplacian form of the
+        // viscous term, 2 S_ij d_j(nu_lat). The strain rate is taken from the
+        // non-equilibrium second moments, so this needs no velocity gradient and
+        // no neighbour access. It vanishes identically where the porosity is
+        // uniform, since grad(nu_lat) is then zero.
+        {
+            double dnx = GradNu[n];
+            double dny = GradNu[Np + n];
+            double dnz = GradNu[2 * Np + n];
+            if (dnx != 0.0 || dny != 0.0 || dnz != 0.0) {
+                double ei = 1.0 / porosity;
+                double q9 = m9 - (2.0 * ux * ux - uy * uy - uz * uz) * Den * ei;
+                double q11 = m11 - (uy * uy - uz * uz) * Den * ei;
+                double q13 = m13 - ux * uy * Den * ei;
+                double q14 = m14 - uy * uz * Den * ei;
+                double q15 = m15 - ux * uz * Den * ei;
+                double cS = -1.5 * rlx_setA / Den;
+                double Sxx = cS * (q9 / 3.0);
+                double Syy = cS * (0.5 * (q11 - q9 / 3.0));
+                double Szz = -Sxx - Syy;
+                double Sxy = cS * q13, Syz = cS * q14, Sxz = cS * q15;
+                Fx -= 2.0 * Den * (Sxx * dnx + Sxy * dny + Sxz * dnz);
+                Fy -= 2.0 * Den * (Sxy * dnx + Syy * dny + Syz * dnz);
+                Fz -= 2.0 * Den * (Sxz * dnx + Syz * dny + Szz * dnz);
+            }
+        }
+
 
         //Calculate pressure for Incompressible-MRT model
         pressure =
-            0.5 / porosity * (pressure - 0.5 * Den * u_mag * u_mag / porosity);
+            0.5 * (pressure - 0.5 * Den * u_mag * u_mag / porosity);
 
         //-------------------- IMRT collison where body force has higher-order terms -------------//
         //		//..............carry out relaxation process...............................................
-        //		m1 = m1 + rlx_setA*((-30*Den+19*Den*(ux*ux+uy*uy+uz*uz)/porosity + 57*pressure*porosity) - m1)
+        //		m1 = m1 + rlx_setA*((-30*Den+19*Den*(ux*ux+uy*uy+uz*uz)/porosity + 57*pressure) - m1)
         //                + (1-0.5*rlx_setA)*38*(Fx*ux+Fy*uy+Fz*uz)/porosity;
-        //		m2 = m2 + rlx_setA*((12*Den - 5.5*Den*(ux*ux+uy*uy+uz*uz)/porosity-27*pressure*porosity) - m2)
+        //		m2 = m2 + rlx_setA*((12*Den - 5.5*Den*(ux*ux+uy*uy+uz*uz)/porosity-27*pressure) - m2)
         //                + (1-0.5*rlx_setA)*11*(-Fx*ux-Fy*uy-Fz*uz)/porosity;
         //        jx = jx + Fx;
         //		m4 = m4 + rlx_setB*((-0.6666666666666666*ux*Den) - m4)
@@ -1151,12 +1295,12 @@ extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
         m1 = m1 +
              rlx_setA * ((-30 * Den +
                           19 * Den * (ux * ux + uy * uy + uz * uz) / porosity +
-                          57 * pressure * porosity) -
+                          57 * pressure) -
                          m1);
         m2 = m2 +
              rlx_setA * ((12 * Den -
                           5.5 * Den * (ux * ux + uy * uy + uz * uz) / porosity -
-                          27 * pressure * porosity) -
+                          27 * pressure) -
                          m2);
         jx = jx + Fx;
         m4 = m4 + rlx_setB * ((-0.6666666666666666 * ux * Den) - m4) +
@@ -1305,7 +1449,7 @@ extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
 extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
     int *neighborList, double *dist, int start, int finish, int Np, double rlx,
     double rlx_eff, double Gx, double Gy, double Gz, double *Poros,
-    double *Perm, double *Velocity, double Den, double *Pressure) {
+    double *Perm, double *Velocity, double Den, double *Pressure, double *GradNu) {
     int nread;
     double vx, vy, vz, v_mag;
     double ux, uy, uz, u_mag;
@@ -1321,6 +1465,7 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
     double perm;                                 //voxel permeability
     double c0, c1;                               //Guo's model parameters
     double mu_eff = (1.0 / rlx_eff - 0.5) / 3.0; //kinematic viscosity
+    double nu_e = (1.0 / rlx - 0.5) / 3.0; //target effective viscosity
     double Fx, Fy,
         Fz; //The total body force including Brinkman force and user-specified (Gx,Gy,Gz)
     double rlx_setA = rlx;
@@ -1636,19 +1781,25 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
         //---------------------------------------------------------------------//
 
         porosity = Poros[n];
+        #if GREY_LOCAL_TAU
+        //local relaxation time: tau(x) = 1/2 + 3*nu_e/eps(x)
+        double eps_t = porosity > GreyTauPorosityMin ? porosity : GreyTauPorosityMin;
+        rlx_setA = 1.0 / (0.5 + 3.0 * nu_e / eps_t);
+        rlx_setB = 8.f * (2.f - rlx_setA) / (8.f - rlx_setA);
+        #endif
         perm = Perm[n];
 
-        c0 = 0.5 * (1.0 + porosity * 0.5 * mu_eff / perm);
+        c0 = 0.5 * (1.0 + 0.5 * mu_eff / perm);
         if (porosity == 1.0)
             c0 = 0.5; //i.e. apparent pore nodes
-        GeoFun = 1.75 / sqrt(150.0 * porosity * porosity * porosity);
-        c1 = porosity * 0.5 * GeoFun / sqrt(perm);
+        GeoFun = GreyForchheimerScale * 1.75 / sqrt(150.0 * porosity * porosity * porosity);
+        c1 = 0.5 * GeoFun / sqrt(perm);
         if (porosity == 1.0)
             c1 = 0.0; //i.e. apparent pore nodes
 
-        vx = jx / Den + 0.5 * porosity * Gx;
-        vy = jy / Den + 0.5 * porosity * Gy;
-        vz = jz / Den + 0.5 * porosity * Gz;
+        vx = jx / Den + 0.5 * Gx;
+        vy = jy / Den + 0.5 * Gy;
+        vz = jz / Den + 0.5 * Gz;
         v_mag = sqrt(vx * vx + vy * vy + vz * vz);
         ux = vx / (c0 + sqrt(c0 * c0 + c1 * v_mag));
         uy = vy / (c0 + sqrt(c0 * c0 + c1 * v_mag));
@@ -1657,29 +1808,56 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
 
         //Update the total force to include linear (Darcy) and nonlinear (Forchheimer) drags due to the porous medium
         Fx =
-            Den * (-porosity * mu_eff / perm * ux -
-                   porosity * GeoFun / sqrt(perm) * u_mag * ux + porosity * Gx);
+            Den * (-mu_eff / perm * ux -
+                   GeoFun / sqrt(perm) * u_mag * ux + Gx);
         Fy =
-            Den * (-porosity * mu_eff / perm * uy -
-                   porosity * GeoFun / sqrt(perm) * u_mag * uy + porosity * Gy);
+            Den * (-mu_eff / perm * uy -
+                   GeoFun / sqrt(perm) * u_mag * uy + Gy);
         Fz =
-            Den * (-porosity * mu_eff / perm * uz -
-                   porosity * GeoFun / sqrt(perm) * u_mag * uz + porosity * Gz);
+            Den * (-mu_eff / perm * uz -
+                   GeoFun / sqrt(perm) * u_mag * uz + Gz);
         if (porosity == 1.0) {
             Fx = Den * Gx;
             Fy = Den * Gy;
             Fz = Den * Gz;
         }
+        // Remove the excess of the divergence form over the Laplacian form of the
+        // viscous term, 2 S_ij d_j(nu_lat). The strain rate is taken from the
+        // non-equilibrium second moments, so this needs no velocity gradient and
+        // no neighbour access. It vanishes identically where the porosity is
+        // uniform, since grad(nu_lat) is then zero.
+        {
+            double dnx = GradNu[n];
+            double dny = GradNu[Np + n];
+            double dnz = GradNu[2 * Np + n];
+            if (dnx != 0.0 || dny != 0.0 || dnz != 0.0) {
+                double ei = 1.0 / porosity;
+                double q9 = m9 - (2.0 * ux * ux - uy * uy - uz * uz) * Den * ei;
+                double q11 = m11 - (uy * uy - uz * uz) * Den * ei;
+                double q13 = m13 - ux * uy * Den * ei;
+                double q14 = m14 - uy * uz * Den * ei;
+                double q15 = m15 - ux * uz * Den * ei;
+                double cS = -1.5 * rlx_setA / Den;
+                double Sxx = cS * (q9 / 3.0);
+                double Syy = cS * (0.5 * (q11 - q9 / 3.0));
+                double Szz = -Sxx - Syy;
+                double Sxy = cS * q13, Syz = cS * q14, Sxz = cS * q15;
+                Fx -= 2.0 * Den * (Sxx * dnx + Sxy * dny + Sxz * dnz);
+                Fy -= 2.0 * Den * (Sxy * dnx + Syy * dny + Syz * dnz);
+                Fz -= 2.0 * Den * (Sxz * dnx + Syz * dny + Szz * dnz);
+            }
+        }
+
 
         //Calculate pressure for Incompressible-MRT model
         pressure =
-            0.5 / porosity * (pressure - 0.5 * Den * u_mag * u_mag / porosity);
+            0.5 * (pressure - 0.5 * Den * u_mag * u_mag / porosity);
 
         //-------------------- IMRT collison where body force has higher-order terms -------------//
         //		//..............carry out relaxation process...............................................
-        //		m1 = m1 + rlx_setA*((-30*Den+19*Den*(ux*ux+uy*uy+uz*uz)/porosity + 57*pressure*porosity) - m1)
+        //		m1 = m1 + rlx_setA*((-30*Den+19*Den*(ux*ux+uy*uy+uz*uz)/porosity + 57*pressure) - m1)
         //                + (1-0.5*rlx_setA)*38*(Fx*ux+Fy*uy+Fz*uz)/porosity;
-        //		m2 = m2 + rlx_setA*((12*Den - 5.5*Den*(ux*ux+uy*uy+uz*uz)/porosity-27*pressure*porosity) - m2)
+        //		m2 = m2 + rlx_setA*((12*Den - 5.5*Den*(ux*ux+uy*uy+uz*uz)/porosity-27*pressure) - m2)
         //                + (1-0.5*rlx_setA)*11*(-Fx*ux-Fy*uy-Fz*uz)/porosity;
         //        jx = jx + Fx;
         //		m4 = m4 + rlx_setB*((-0.6666666666666666*ux*Den) - m4)
@@ -1714,12 +1892,12 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
         m1 = m1 +
              rlx_setA * ((-30 * Den +
                           19 * Den * (ux * ux + uy * uy + uz * uz) / porosity +
-                          57 * pressure * porosity) -
+                          57 * pressure) -
                          m1);
         m2 = m2 +
              rlx_setA * ((12 * Den -
                           5.5 * Den * (ux * ux + uy * uy + uz * uz) / porosity -
-                          27 * pressure * porosity) -
+                          27 * pressure) -
                          m2);
         jx = jx + Fx;
         m4 = m4 + rlx_setB * ((-0.6666666666666666 * ux * Den) - m4) +
@@ -1886,7 +2064,7 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
 extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_MRT(
     int *neighborList, double *dist, int start, int finish, int Np, double rlx,
     double rlx_eff, double Gx, double Gy, double Gz, double *Poros,
-    double *Perm, double *Velocity, double rho0, double *Pressure) {
+    double *Perm, double *Velocity, double rho0, double *Pressure, double *GradNu) {
 
     int nread;
     int nr1, nr2, nr3, nr4, nr5, nr6;
@@ -1906,6 +2084,7 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_MRT(
     double perm;                                 //voxel permeability
     double c0, c1;                               //Guo's model parameters
     double mu_eff = (1.0 / rlx_eff - 0.5) / 3.0; //kinematic viscosity
+    double nu_e = (1.0 / rlx - 0.5) / 3.0; //target effective viscosity
     double Fx, Fy,
         Fz; //The total body force including Brinkman force and user-specified (Gx,Gy,Gz)
     double rlx_setA = rlx;
@@ -2252,19 +2431,25 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_MRT(
         //---------------------------------------------------------------------//
 
         porosity = Poros[n];
+        #if GREY_LOCAL_TAU
+        //local relaxation time: tau(x) = 1/2 + 3*nu_e/eps(x)
+        double eps_t = porosity > GreyTauPorosityMin ? porosity : GreyTauPorosityMin;
+        rlx_setA = 1.0 / (0.5 + 3.0 * nu_e / eps_t);
+        rlx_setB = 8.f * (2.f - rlx_setA) / (8.f - rlx_setA);
+        #endif
         perm = Perm[n];
 
-        c0 = 0.5 * (1.0 + porosity * 0.5 * mu_eff / perm);
+        c0 = 0.5 * (1.0 + 0.5 * mu_eff / perm);
         if (porosity == 1.0)
             c0 = 0.5; //i.e. apparent pore nodes
-        GeoFun = 1.75 / sqrt(150.0 * porosity * porosity * porosity);
-        c1 = porosity * 0.5 * GeoFun / sqrt(perm);
+        GeoFun = GreyForchheimerScale * 1.75 / sqrt(150.0 * porosity * porosity * porosity);
+        c1 = 0.5 * GeoFun / sqrt(perm);
         if (porosity == 1.0)
             c1 = 0.0; //i.e. apparent pore nodes
 
-        vx = jx / rho0 + 0.5 * porosity * Gx;
-        vy = jy / rho0 + 0.5 * porosity * Gy;
-        vz = jz / rho0 + 0.5 * porosity * Gz;
+        vx = jx / rho0 + 0.5 * Gx;
+        vy = jy / rho0 + 0.5 * Gy;
+        vz = jz / rho0 + 0.5 * Gz;
         v_mag = sqrt(vx * vx + vy * vy + vz * vz);
         ux = vx / (c0 + sqrt(c0 * c0 + c1 * v_mag));
         uy = vy / (c0 + sqrt(c0 * c0 + c1 * v_mag));
@@ -2273,20 +2458,47 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_MRT(
 
         //Update the total force to include linear (Darcy) and nonlinear (Forchheimer) drags due to the porous medium
         Fx = rho0 *
-             (-porosity * mu_eff / perm * ux -
-              porosity * GeoFun / sqrt(perm) * u_mag * ux + porosity * Gx);
+             (-mu_eff / perm * ux -
+              GeoFun / sqrt(perm) * u_mag * ux + Gx);
         Fy = rho0 *
-             (-porosity * mu_eff / perm * uy -
-              porosity * GeoFun / sqrt(perm) * u_mag * uy + porosity * Gy);
+             (-mu_eff / perm * uy -
+              GeoFun / sqrt(perm) * u_mag * uy + Gy);
         Fz = rho0 *
-             (-porosity * mu_eff / perm * uz -
-              porosity * GeoFun / sqrt(perm) * u_mag * uz + porosity * Gz);
+             (-mu_eff / perm * uz -
+              GeoFun / sqrt(perm) * u_mag * uz + Gz);
         if (porosity == 1.0) {
             Fx = rho0 * Gx;
 
             Fy = rho0 * Gy;
             Fz = rho0 * Gz;
         }
+        // Remove the excess of the divergence form over the Laplacian form of the
+        // viscous term, 2 S_ij d_j(nu_lat). The strain rate is taken from the
+        // non-equilibrium second moments, so this needs no velocity gradient and
+        // no neighbour access. It vanishes identically where the porosity is
+        // uniform, since grad(nu_lat) is then zero.
+        {
+            double dnx = GradNu[n];
+            double dny = GradNu[Np + n];
+            double dnz = GradNu[2 * Np + n];
+            if (dnx != 0.0 || dny != 0.0 || dnz != 0.0) {
+                double ei = 1.0 / porosity;
+                double q9 = m9 - (2.0 * ux * ux - uy * uy - uz * uz) * rho0 * ei;
+                double q11 = m11 - (uy * uy - uz * uz) * rho0 * ei;
+                double q13 = m13 - ux * uy * rho0 * ei;
+                double q14 = m14 - uy * uz * rho0 * ei;
+                double q15 = m15 - ux * uz * rho0 * ei;
+                double cS = -1.5 * rlx_setA / rho0;
+                double Sxx = cS * (q9 / 3.0);
+                double Syy = cS * (0.5 * (q11 - q9 / 3.0));
+                double Szz = -Sxx - Syy;
+                double Sxy = cS * q13, Syz = cS * q14, Sxz = cS * q15;
+                Fx -= 2.0 * rho0 * (Sxx * dnx + Sxy * dny + Sxz * dnz);
+                Fy -= 2.0 * rho0 * (Sxy * dnx + Syy * dny + Syz * dnz);
+                Fz -= 2.0 * rho0 * (Sxz * dnx + Syz * dny + Szz * dnz);
+            }
+        }
+
 
         //Calculate pressure for MRT model
         //pressure=rho/3.f/porosity;
@@ -2463,7 +2675,7 @@ extern "C" void ScaLBL_D3Q19_AAodd_Greyscale_MRT(
 extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_MRT(
     double *dist, int start, int finish, int Np, double rlx, double rlx_eff,
     double Gx, double Gy, double Gz, double *Poros, double *Perm,
-    double *Velocity, double rho0, double *Pressure) {
+    double *Velocity, double rho0, double *Pressure, double *GradNu) {
 
     double vx, vy, vz, v_mag;
     double ux, uy, uz, u_mag;
@@ -2479,6 +2691,7 @@ extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_MRT(
     double perm;                                 //voxel permeability
     double c0, c1;                               //Guo's model parameters
     double mu_eff = (1.0 / rlx_eff - 0.5) / 3.0; //kinematic viscosity
+    double nu_e = (1.0 / rlx - 0.5) / 3.0; //target effective viscosity
     double Fx, Fy,
         Fz; //The total body force including Brinkman force and user-specified (Gx,Gy,Gz)
     double rlx_setA = rlx;
@@ -2774,19 +2987,25 @@ extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_MRT(
         //---------------------------------------------------------------------//
 
         porosity = Poros[n];
+        #if GREY_LOCAL_TAU
+        //local relaxation time: tau(x) = 1/2 + 3*nu_e/eps(x)
+        double eps_t = porosity > GreyTauPorosityMin ? porosity : GreyTauPorosityMin;
+        rlx_setA = 1.0 / (0.5 + 3.0 * nu_e / eps_t);
+        rlx_setB = 8.f * (2.f - rlx_setA) / (8.f - rlx_setA);
+        #endif
         perm = Perm[n];
 
-        c0 = 0.5 * (1.0 + porosity * 0.5 * mu_eff / perm);
+        c0 = 0.5 * (1.0 + 0.5 * mu_eff / perm);
         if (porosity == 1.0)
             c0 = 0.5; //i.e. apparent pore nodes
-        GeoFun = 1.75 / sqrt(150.0 * porosity * porosity * porosity);
-        c1 = porosity * 0.5 * GeoFun / sqrt(perm);
+        GeoFun = GreyForchheimerScale * 1.75 / sqrt(150.0 * porosity * porosity * porosity);
+        c1 = 0.5 * GeoFun / sqrt(perm);
         if (porosity == 1.0)
             c1 = 0.0; //i.e. apparent pore nodes
 
-        vx = jx / rho0 + 0.5 * porosity * Gx;
-        vy = jy / rho0 + 0.5 * porosity * Gy;
-        vz = jz / rho0 + 0.5 * porosity * Gz;
+        vx = jx / rho0 + 0.5 * Gx;
+        vy = jy / rho0 + 0.5 * Gy;
+        vz = jz / rho0 + 0.5 * Gz;
         v_mag = sqrt(vx * vx + vy * vy + vz * vz);
         ux = vx / (c0 + sqrt(c0 * c0 + c1 * v_mag));
         uy = vy / (c0 + sqrt(c0 * c0 + c1 * v_mag));
@@ -2795,19 +3014,46 @@ extern "C" void ScaLBL_D3Q19_AAeven_Greyscale_MRT(
 
         //Update the total force to include linear (Darcy) and nonlinear (Forchheimer) drags due to the porous medium
         Fx = rho0 *
-             (-porosity * mu_eff / perm * ux -
-              porosity * GeoFun / sqrt(perm) * u_mag * ux + porosity * Gx);
+             (-mu_eff / perm * ux -
+              GeoFun / sqrt(perm) * u_mag * ux + Gx);
         Fy = rho0 *
-             (-porosity * mu_eff / perm * uy -
-              porosity * GeoFun / sqrt(perm) * u_mag * uy + porosity * Gy);
+             (-mu_eff / perm * uy -
+              GeoFun / sqrt(perm) * u_mag * uy + Gy);
         Fz = rho0 *
-             (-porosity * mu_eff / perm * uz -
-              porosity * GeoFun / sqrt(perm) * u_mag * uz + porosity * Gz);
+             (-mu_eff / perm * uz -
+              GeoFun / sqrt(perm) * u_mag * uz + Gz);
         if (porosity == 1.0) {
             Fx = rho0 * Gx;
             Fy = rho0 * Gy;
             Fz = rho0 * Gz;
         }
+        // Remove the excess of the divergence form over the Laplacian form of the
+        // viscous term, 2 S_ij d_j(nu_lat). The strain rate is taken from the
+        // non-equilibrium second moments, so this needs no velocity gradient and
+        // no neighbour access. It vanishes identically where the porosity is
+        // uniform, since grad(nu_lat) is then zero.
+        {
+            double dnx = GradNu[n];
+            double dny = GradNu[Np + n];
+            double dnz = GradNu[2 * Np + n];
+            if (dnx != 0.0 || dny != 0.0 || dnz != 0.0) {
+                double ei = 1.0 / porosity;
+                double q9 = m9 - (2.0 * ux * ux - uy * uy - uz * uz) * rho0 * ei;
+                double q11 = m11 - (uy * uy - uz * uz) * rho0 * ei;
+                double q13 = m13 - ux * uy * rho0 * ei;
+                double q14 = m14 - uy * uz * rho0 * ei;
+                double q15 = m15 - ux * uz * rho0 * ei;
+                double cS = -1.5 * rlx_setA / rho0;
+                double Sxx = cS * (q9 / 3.0);
+                double Syy = cS * (0.5 * (q11 - q9 / 3.0));
+                double Szz = -Sxx - Syy;
+                double Sxy = cS * q13, Syz = cS * q14, Sxz = cS * q15;
+                Fx -= 2.0 * rho0 * (Sxx * dnx + Sxy * dny + Sxz * dnz);
+                Fy -= 2.0 * rho0 * (Sxy * dnx + Syy * dny + Syz * dnz);
+                Fz -= 2.0 * rho0 * (Sxz * dnx + Syz * dny + Szz * dnz);
+            }
+        }
+
 
         //Calculate pressure for Incompressible-MRT model
         //pressure=rho/3.f/porosity;

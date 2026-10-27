@@ -19,15 +19,20 @@
 #include "models/GreyscaleModel.h"
 #include "analysis/distance.h"
 #include "analysis/morphology.h"
+#include <algorithm>
 #include <stdlib.h>
 #include <time.h>
+
+extern "C" void ScaLBL_D3Q19_Greyscale_Config(int *local_tau);
+
 
 template <class TYPE> void DeleteArray(const TYPE *p) { delete[] p; }
 
 ScaLBL_GreyscaleModel::ScaLBL_GreyscaleModel(int RANK, int NP,
                                              const Utilities::MPI &COMM)
     : rank(RANK), nprocs(NP), Restart(0), timestep(0), timestepMax(0), tau(0),
-      tau_eff(0), Den(0), Fx(0), Fy(0), Fz(0), flux(0), din(0), dout(0),
+      tau_eff(0), tau_eff_defaulted(true), Den(0), Fx(0), Fy(0), Fz(0),
+      flux(0), din(0), dout(0),
       GreyPorosity(0), Nx(0), Ny(0), Nz(0), N(0), Np(0), nprocx(0), nprocy(0),
       nprocz(0), BoundaryCondition(0), Lx(0), Ly(0), Lz(0), comm(COMM) {
     SignDist.resize(Nx, Ny, Nz);
@@ -63,7 +68,34 @@ void ScaLBL_GreyscaleModel::ReadParams(string filename) {
     if (greyscale_db->keyExists("tau")) {
         tau = greyscale_db->getScalar<double>("tau");
     }
+    // tau sets the lattice (Brinkman) viscosity; tau_eff sets the fluid
+    // viscosity entering the Darcy/Forchheimer drag and the c0/c1 closure.
+    // These are distinct quantities: only the lattice viscosity is rescaled
+    // by porosity.  Defaulting tau_eff to tau asserts nu_e = nu.
+    tau_eff_defaulted = !greyscale_db->keyExists("tau_eff");
     tau_eff = greyscale_db->getWithDefault<double>("tau_eff", tau);
+    //Forchheimer = false gives a purely linear Darcy-Brinkman problem, for
+    //which the permeability is independent of the applied body force.
+    Forchheimer = greyscale_db->getWithDefault<bool>("Forchheimer", true);
+    //Lower bound on the porosity entering tau(x). It caps the lattice
+    //viscosity nu_e/eps in poorly resolved voxels. It does not touch the drag,
+    //the permeability field, or the equilibrium. Stability of the local
+    //relaxation time is governed by the viscosity ratio between ADJACENT
+    //voxels, not by the global range: a field with a large global range but
+    //smooth variation runs without difficulty, whereas a block-averaged field
+    //with the same range and voxel-scale jumps may not.
+    //Set to 0 to disable the floor entirely, so that tau is scaled by the
+    //true porosity of every voxel.
+    tau_porosity_min =
+        greyscale_db->getWithDefault<double>("TauPorosityMin", 0.05);
+    //Number of 3^3 box-mean passes applied to the porosity field that sets
+    //tau(x). Each pass averages a voxel with its fluid neighbours, so repeated
+    //passes widen the support with a smooth (binomial) weighting. This targets
+    //the voxel-to-voxel viscosity jumps that destabilise the local relaxation
+    //time, without capping tau anywhere. The permeability field, and hence the
+    //Darcy drag, is left at its true per-voxel value. Set to 0 to disable.
+    tau_smoothing_passes =
+        greyscale_db->getWithDefault<int>("TauSmoothingPasses", 0);
     if (greyscale_db->keyExists("Den")) {
         Den = greyscale_db->getScalar<double>("Den");
     }
@@ -428,6 +460,7 @@ void ScaLBL_GreyscaleModel::Create() {
     ScaLBL_AllocateDeviceMemory((void **)&fq, 19 * dist_mem_size);
     ScaLBL_AllocateDeviceMemory((void **)&Permeability, sizeof(double) * Np);
     ScaLBL_AllocateDeviceMemory((void **)&Porosity, sizeof(double) * Np);
+    ScaLBL_AllocateDeviceMemory((void **)&GradNuLat, 3 * sizeof(double) * Np);
     ScaLBL_AllocateDeviceMemory((void **)&Pressure_dvc, sizeof(double) * Np);
     ScaLBL_AllocateDeviceMemory((void **)&Velocity, 3 * sizeof(double) * Np);
     //...........................................................................
@@ -455,8 +488,14 @@ void ScaLBL_GreyscaleModel::Create() {
         ERROR("Error: PorosityList or FilenameVoxelPorosityMap cannot be "
               "found! \n");
     }
+    SmoothPorosityField(Poros, tau_smoothing_passes);
+    ReportGreyscaleField(Poros, Perm);
+    double *GradHost = new double[3 * Np];
+    ComputeViscosityGradient(Poros, GradHost);
     ScaLBL_CopyToDevice(Porosity, Poros, Np * sizeof(double));
     ScaLBL_CopyToDevice(Permeability, Perm, Np * sizeof(double));
+    ScaLBL_CopyToDevice(GradNuLat, GradHost, 3 * Np * sizeof(double));
+    delete[] GradHost;
     delete[] Poros;
     delete[] Perm;
 }
@@ -532,6 +571,9 @@ void ScaLBL_GreyscaleModel::Run() {
         visualization_interval =
             analysis_db->getScalar<int>("visualization_interval");
     }
+    //output setting: dump the streamwise velocity profile at convergence
+    write_velocity_profile =
+        analysis_db->getWithDefault<bool>("WriteVelocityProfile", false);
     if (analysis_db->keyExists("restart_interval")) {
         restart_interval = analysis_db->getScalar<int>("restart_interval");
     }
@@ -539,9 +581,25 @@ void ScaLBL_GreyscaleModel::Run() {
         timestep = greyscale_db->getScalar<int>("timestep");
     }
 
+    //push the Forchheimer switch down to the collision kernels
+    ScaLBL_D3Q19_Greyscale_SetForchheimer(Forchheimer ? 1 : 0);
+    ScaLBL_D3Q19_Greyscale_SetTauPorosityMin(tau_porosity_min);
+
     if (rank == 0) {
         printf("********************************************************\n");
         printf("No. of timesteps: %i \n", timestepMax);
+        printf("tau     = %.6g   (lattice viscosity nu_e = %.6g)\n", tau,
+               (tau - 0.5) / 3.0);
+        printf("tau_eff = %.6g   (drag viscosity    nu   = %.6g)%s\n", tau_eff,
+               (tau_eff - 0.5) / 3.0,
+               tau_eff_defaulted ? "   [not set; defaulted to tau]" : "");
+        {
+            int local_tau;
+            ScaLBL_D3Q19_Greyscale_Config(&local_tau);
+            printf("local tau(x) = %s   |   Forchheimer drag = %s\n",
+                   local_tau ? "ON  (tau = 1/2 + 3*nu_e/eps)" : "OFF (uniform tau)",
+                   Forchheimer ? "ON" : "OFF");
+        }
         fflush(stdout);
     }
 
@@ -570,25 +628,25 @@ void ScaLBL_GreyscaleModel::Run() {
             ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
                 NeighborList, fq, ScaLBL_Comm->FirstInterior(),
                 ScaLBL_Comm->LastInterior(), Np, rlx, rlx_eff, Fx, Fy, Fz,
-                Porosity, Permeability, Velocity, Den, Pressure_dvc);
+                Porosity, Permeability, Velocity, Den, Pressure_dvc, GradNuLat);
             break;
         case 2:
             ScaLBL_D3Q19_AAodd_Greyscale(
                 NeighborList, fq, ScaLBL_Comm->FirstInterior(),
                 ScaLBL_Comm->LastInterior(), Np, rlx, rlx_eff, Fx, Fy, Fz,
-                Porosity, Permeability, Velocity, Pressure_dvc);
+                Porosity, Permeability, Velocity, Pressure_dvc, GradNuLat);
             break;
         case 3:
             ScaLBL_D3Q19_AAodd_Greyscale_MRT(
                 NeighborList, fq, ScaLBL_Comm->FirstInterior(),
                 ScaLBL_Comm->LastInterior(), Np, rlx, rlx_eff, Fx, Fy, Fz,
-                Porosity, Permeability, Velocity, Den, Pressure_dvc);
+                Porosity, Permeability, Velocity, Den, Pressure_dvc, GradNuLat);
             break;
         default:
             ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
                 NeighborList, fq, ScaLBL_Comm->FirstInterior(),
                 ScaLBL_Comm->LastInterior(), Np, rlx, rlx_eff, Fx, Fy, Fz,
-                Porosity, Permeability, Velocity, Den, Pressure_dvc);
+                Porosity, Permeability, Velocity, Den, Pressure_dvc, GradNuLat);
             break;
         }
         ScaLBL_Comm->RecvD3Q19AA(fq); //WRITE INTO OPPOSITE
@@ -603,25 +661,25 @@ void ScaLBL_GreyscaleModel::Run() {
             ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
                 NeighborList, fq, 0, ScaLBL_Comm->LastExterior(), Np, rlx,
                 rlx_eff, Fx, Fy, Fz, Porosity, Permeability, Velocity, Den,
-                Pressure_dvc);
+                Pressure_dvc, GradNuLat);
             break;
         case 2:
             ScaLBL_D3Q19_AAodd_Greyscale(NeighborList, fq, 0,
                                          ScaLBL_Comm->LastExterior(), Np, rlx,
                                          rlx_eff, Fx, Fy, Fz, Porosity,
-                                         Permeability, Velocity, Pressure_dvc);
+                                         Permeability, Velocity, Pressure_dvc, GradNuLat);
             break;
         case 3:
             ScaLBL_D3Q19_AAodd_Greyscale_MRT(
                 NeighborList, fq, 0, ScaLBL_Comm->LastExterior(), Np, rlx,
                 rlx_eff, Fx, Fy, Fz, Porosity, Permeability, Velocity, Den,
-                Pressure_dvc);
+                Pressure_dvc, GradNuLat);
             break;
         default:
             ScaLBL_D3Q19_AAodd_Greyscale_IMRT(
                 NeighborList, fq, 0, ScaLBL_Comm->LastExterior(), Np, rlx,
                 rlx_eff, Fx, Fy, Fz, Porosity, Permeability, Velocity, Den,
-                Pressure_dvc);
+                Pressure_dvc, GradNuLat);
             break;
         }
         ScaLBL_DeviceBarrier();
@@ -635,25 +693,25 @@ void ScaLBL_GreyscaleModel::Run() {
             ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
                 fq, ScaLBL_Comm->FirstInterior(), ScaLBL_Comm->LastInterior(),
                 Np, rlx, rlx_eff, Fx, Fy, Fz, Porosity, Permeability, Velocity,
-                Den, Pressure_dvc);
+                Den, Pressure_dvc, GradNuLat);
             break;
         case 2:
             ScaLBL_D3Q19_AAeven_Greyscale(fq, ScaLBL_Comm->FirstInterior(),
                                           ScaLBL_Comm->LastInterior(), Np, rlx,
                                           rlx_eff, Fx, Fy, Fz, Porosity,
-                                          Permeability, Velocity, Pressure_dvc);
+                                          Permeability, Velocity, Pressure_dvc, GradNuLat);
             break;
         case 3:
             ScaLBL_D3Q19_AAeven_Greyscale_MRT(
                 fq, ScaLBL_Comm->FirstInterior(), ScaLBL_Comm->LastInterior(),
                 Np, rlx, rlx_eff, Fx, Fy, Fz, Porosity, Permeability, Velocity,
-                Den, Pressure_dvc);
+                Den, Pressure_dvc, GradNuLat);
             break;
         default:
             ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
                 fq, ScaLBL_Comm->FirstInterior(), ScaLBL_Comm->LastInterior(),
                 Np, rlx, rlx_eff, Fx, Fy, Fz, Porosity, Permeability, Velocity,
-                Den, Pressure_dvc);
+                Den, Pressure_dvc, GradNuLat);
             break;
         }
         ScaLBL_Comm->RecvD3Q19AA(fq); //WRITE INTO OPPOSITE
@@ -667,22 +725,22 @@ void ScaLBL_GreyscaleModel::Run() {
         case 1:
             ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
                 fq, 0, ScaLBL_Comm->LastExterior(), Np, rlx, rlx_eff, Fx, Fy,
-                Fz, Porosity, Permeability, Velocity, Den, Pressure_dvc);
+                Fz, Porosity, Permeability, Velocity, Den, Pressure_dvc, GradNuLat);
             break;
         case 2:
             ScaLBL_D3Q19_AAeven_Greyscale(
                 fq, 0, ScaLBL_Comm->LastExterior(), Np, rlx, rlx_eff, Fx, Fy,
-                Fz, Porosity, Permeability, Velocity, Pressure_dvc);
+                Fz, Porosity, Permeability, Velocity, Pressure_dvc, GradNuLat);
             break;
         case 3:
             ScaLBL_D3Q19_AAeven_Greyscale_MRT(
                 fq, 0, ScaLBL_Comm->LastExterior(), Np, rlx, rlx_eff, Fx, Fy,
-                Fz, Porosity, Permeability, Velocity, Den, Pressure_dvc);
+                Fz, Porosity, Permeability, Velocity, Den, Pressure_dvc, GradNuLat);
             break;
         default:
             ScaLBL_D3Q19_AAeven_Greyscale_IMRT(
                 fq, 0, ScaLBL_Comm->LastExterior(), Np, rlx, rlx_eff, Fx, Fy,
-                Fz, Porosity, Permeability, Velocity, Den, Pressure_dvc);
+                Fz, Porosity, Permeability, Velocity, Den, Pressure_dvc, GradNuLat);
             break;
         }
         ScaLBL_DeviceBarrier();
@@ -845,6 +903,9 @@ void ScaLBL_GreyscaleModel::Run() {
         }
     }
 
+    if (write_velocity_profile)
+        WriteVelocityProfile();
+
     PROFILE_STOP("Loop");
     PROFILE_SAVE("lbpm_greyscale_simulator", 1);
     //************************************************************************
@@ -872,6 +933,317 @@ void ScaLBL_GreyscaleModel::Run() {
         printf("********************************************************\n");
 
     // ************************************************************************
+}
+
+/********************************************************
+ * Smooth the porosity field that sets the local tau     *
+ ********************************************************/
+void ScaLBL_GreyscaleModel::SmoothPorosityField(double *Poros, int passes) {
+    if (passes < 1)
+        return;
+
+    //Scatter the sparse fluid-node array onto the regular grid. Solid voxels
+    //carry no porosity and are excluded from every average through the mask,
+    //so the smoothing never bleeds solid into the pore space.
+    DoubleArray eps(Nx, Ny, Nz), msk(Nx, Ny, Nz), num(Nx, Ny, Nz);
+    eps.fill(0.0);
+    msk.fill(0.0);
+    for (int k = 0; k < Nz; k++) {
+        for (int j = 0; j < Ny; j++) {
+            for (int i = 0; i < Nx; i++) {
+                int idx = Map(i, j, k);
+                if (!(idx < 0)) {
+                    eps(i, j, k) = Poros[idx];
+                    msk(i, j, k) = 1.0;
+                }
+            }
+        }
+    }
+
+    double range_in[2] = {1.0e30, -1.0e30};
+    for (int n = 0; n < Np; n++) {
+        //skip the padding slots of the memory-optimised layout, which are
+        //never assigned a porosity
+        if (!(Poros[n] > 0.0))
+            continue;
+        range_in[0] = std::min(range_in[0], Poros[n]);
+        range_in[1] = std::max(range_in[1], Poros[n]);
+    }
+
+    //One 3^3 fluid-weighted box mean per pass. Each pass reads a one-voxel
+    //halo, so the neighbour data is exchanged before every sweep and the
+    //result is independent of the rank decomposition.
+    for (int p = 0; p < passes; p++) {
+        Dm->CommunicateMeshHalo(eps);
+        Dm->CommunicateMeshHalo(msk);
+        num.fill(0.0);
+        for (int k = 1; k < Nz - 1; k++) {
+            for (int j = 1; j < Ny - 1; j++) {
+                for (int i = 1; i < Nx - 1; i++) {
+                    if (msk(i, j, k) < 0.5)
+                        continue;
+                    double sum = 0.0, weight = 0.0;
+                    for (int dk = -1; dk <= 1; dk++) {
+                        for (int dj = -1; dj <= 1; dj++) {
+                            for (int di = -1; di <= 1; di++) {
+                                if (msk(i + di, j + dj, k + dk) > 0.5) {
+                                    sum += eps(i + di, j + dj, k + dk);
+                                    weight += 1.0;
+                                }
+                            }
+                        }
+                    }
+                    num(i, j, k) = weight > 0.0 ? sum / weight : eps(i, j, k);
+                }
+            }
+        }
+        for (int k = 1; k < Nz - 1; k++)
+            for (int j = 1; j < Ny - 1; j++)
+                for (int i = 1; i < Nx - 1; i++)
+                    if (msk(i, j, k) > 0.5)
+                        eps(i, j, k) = num(i, j, k);
+    }
+
+    //Gather back onto the sparse array.
+    for (int k = 0; k < Nz; k++) {
+        for (int j = 0; j < Ny; j++) {
+            for (int i = 0; i < Nx; i++) {
+                int idx = Map(i, j, k);
+                if (!(idx < 0))
+                    Poros[idx] = eps(i, j, k);
+            }
+        }
+    }
+
+    double range_out[2] = {1.0e30, -1.0e30};
+    for (int n = 0; n < Np; n++) {
+        //skip the padding slots of the memory-optimised layout, which are
+        //never assigned a porosity
+        if (!(Poros[n] > 0.0))
+            continue;
+        range_out[0] = std::min(range_out[0], Poros[n]);
+        range_out[1] = std::max(range_out[1], Poros[n]);
+    }
+    double lo_in = Dm->Comm.minReduce(range_in[0]);
+    double hi_in = Dm->Comm.maxReduce(range_in[1]);
+    double lo_out = Dm->Comm.minReduce(range_out[0]);
+    double hi_out = Dm->Comm.maxReduce(range_out[1]);
+    if (rank == 0) {
+        printf("tau smoothing  : %d pass(es), eps %.4g .. %.4g -> %.4g .. "
+               "%.4g   (permeability field unchanged)\n",
+               passes, lo_in, hi_in, lo_out, hi_out);
+    }
+}
+
+/********************************************************
+ * Gradient of the lattice viscosity, for the viscous     *
+ * correction                                             *
+ ********************************************************/
+void ScaLBL_GreyscaleModel::ComputeViscosityGradient(const double *Poros,
+                                                     double *GradHost) {
+    // A spatially varying relaxation time makes the scheme recover the
+    // divergence form div(nu_lat grad u), which exceeds the Laplacian form of
+    // the target momentum equation by 2 S_ij d_j(nu_lat). The kernels remove
+    // that excess through the forcing, for which they need grad(nu_lat) as a
+    // static field. It is evaluated once here by central differences on the
+    // regular grid, with one-sided differences where a neighbour is solid.
+    double nu_e = (tau - 0.5) / 3.0;
+    DoubleArray nl(Nx, Ny, Nz), msk(Nx, Ny, Nz);
+    nl.fill(0.0);
+    msk.fill(0.0);
+    for (int k = 0; k < Nz; k++) {
+        for (int j = 0; j < Ny; j++) {
+            for (int i = 0; i < Nx; i++) {
+                int idx = Map(i, j, k);
+                if (!(idx < 0)) {
+                    double eps = Poros[idx];
+                    double eps_t = eps > tau_porosity_min ? eps : tau_porosity_min;
+                    nl(i, j, k) = nu_e / eps_t;
+                    msk(i, j, k) = 1.0;
+                }
+            }
+        }
+    }
+    Dm->CommunicateMeshHalo(nl);
+    Dm->CommunicateMeshHalo(msk);
+
+    for (int n = 0; n < 3 * Np; n++)
+        GradHost[n] = 0.0;
+    double gmax = 0.0, rmax = 0.0;
+    for (int k = 1; k < Nz - 1; k++) {
+        for (int j = 1; j < Ny - 1; j++) {
+            for (int i = 1; i < Nx - 1; i++) {
+                int idx = Map(i, j, k);
+                if (idx < 0)
+                    continue;
+                int off[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+                for (int d = 0; d < 3; d++) {
+                    int ip = i + off[d][0], jp = j + off[d][1], kp = k + off[d][2];
+                    int im = i - off[d][0], jm = j - off[d][1], km = k - off[d][2];
+                    bool fp = msk(ip, jp, kp) > 0.5, fm = msk(im, jm, km) > 0.5;
+                    double g = 0.0;
+                    if (fp && fm)
+                        g = 0.5 * (nl(ip, jp, kp) - nl(im, jm, km));
+                    else if (fp)
+                        g = nl(ip, jp, kp) - nl(i, j, k);
+                    else if (fm)
+                        g = nl(i, j, k) - nl(im, jm, km);
+                    GradHost[d * Np + idx] = g;
+                    gmax = std::max(gmax, fabs(g));
+                    rmax = std::max(rmax, fabs(g) / nl(i, j, k));
+                }
+            }
+        }
+    }
+    gmax = Dm->Comm.maxReduce(gmax);
+    rmax = Dm->Comm.maxReduce(rmax);
+    if (rank == 0) {
+        //The correction is derived on the premise that nu_lat varies slowly
+        //over a lattice spacing, so the relative change per voxel is the
+        //quantity that decides whether it is applicable. Values around 0.3 or
+        //below reproduce closed-form solutions to better than 0.1%; by 0.75
+        //the scheme diverges. Smoothing the porosity field is the remedy, and
+        //it does not change the converged permeability.
+        printf("viscous correction: max |grad(nu_lat)|/nu_lat = %.3g per voxel"
+               "   (|grad(nu_lat)| = %.4g)\n", rmax, gmax);
+        if (rmax > 0.5)
+            printf("                    WARNING: above 0.5 the correction is "
+                   "outside its validity; increase TauSmoothingPasses\n");
+    }
+}
+
+void ScaLBL_GreyscaleModel::ReportGreyscaleField(const double *Poros,
+                                                 const double *Perm) {
+    // Summarise the greyscale field before the run starts. The quantity that
+    // decides whether the local relaxation time matters is the Brinkman
+    // screening length delta = sqrt(nu_e k / (eps nu)), measured in voxels:
+    // where delta is below one voxel the viscous term is unresolved and the
+    // flow is locally pure Darcy, so the viscous coefficient - and hence
+    // tau(x) - is immaterial there. Note that the tau range printed below
+    // does not by itself predict stability; that depends on the viscosity
+    // ratio between neighbouring voxels, which this summary does not measure.
+    double nu_e = (tau - 0.5) / 3.0;
+    double nu = (tau_eff - 0.5) / 3.0;
+
+    double eps_lo = 1.0e30, eps_hi = -1.0e30;
+    double k_lo = 1.0e30, k_hi = -1.0e30;
+    double d_lo = 1.0e30, d_hi = -1.0e30;
+    double n_tot = 0.0, n_res = 0.0, n_floored = 0.0;
+
+    for (int i = 0; i < Np; i++) {
+        double eps = Poros[i], k = Perm[i];
+        if (!(eps > 0.0) || !(k > 0.0))
+            continue;
+        double eps_t = eps > tau_porosity_min ? eps : tau_porosity_min;
+        double delta = sqrt((nu_e / eps_t) * k / nu); //in voxels
+        eps_lo = std::min(eps_lo, eps); eps_hi = std::max(eps_hi, eps);
+        k_lo = std::min(k_lo, k);       k_hi = std::max(k_hi, k);
+        d_lo = std::min(d_lo, delta);   d_hi = std::max(d_hi, delta);
+        n_tot += 1.0;
+        if (delta > 1.0) n_res += 1.0;
+        if (eps < tau_porosity_min)
+            n_floored += 1.0;
+    }
+    eps_lo = comm.minReduce(eps_lo); eps_hi = comm.maxReduce(eps_hi);
+    k_lo = comm.minReduce(k_lo);     k_hi = comm.maxReduce(k_hi);
+    d_lo = comm.minReduce(d_lo);     d_hi = comm.maxReduce(d_hi);
+    n_tot = comm.sumReduce(n_tot);   n_res = comm.sumReduce(n_res);
+    n_floored = comm.sumReduce(n_floored);
+
+    if (rank != 0 || n_tot == 0.0)
+        return;
+
+    double eps_eff = eps_lo > tau_porosity_min ? eps_lo : tau_porosity_min;
+    printf("greyscale field : eps %.3g .. %.3g   k %.3g .. %.3g [voxel^2]\n",
+           eps_lo, eps_hi, k_lo, k_hi);
+    printf("screening length: delta %.3g .. %.3g voxels   "
+           "(%.2f%% of voxels resolve delta > 1)\n",
+           d_lo, d_hi, 100.0 * n_res / n_tot);
+    if (tau_porosity_min > 0.0)
+        printf("local tau(x)    : tau %.3g .. %.3g   "
+               "(TauPorosityMin = %.3g, floors %.2f%% of voxels)\n",
+               0.5 + 3.0 * nu_e / eps_hi, 0.5 + 3.0 * nu_e / eps_eff,
+               tau_porosity_min, 100.0 * n_floored / n_tot);
+    else
+        printf("local tau(x)    : tau %.3g .. %.3g   "
+               "(TauPorosityMin off; tau follows the true porosity)\n",
+               0.5 + 3.0 * nu_e / eps_hi, 0.5 + 3.0 * nu_e / eps_lo);
+    fflush(stdout);
+}
+
+void ScaLBL_GreyscaleModel::WriteVelocityProfile() {
+    // Mean streamwise velocity across the channel, ubar_z(y), obtained by
+    // averaging over the two homogeneous directions. Written once the run has
+    // converged, for comparison with the Brinkman channel solution. The three
+    // buffer slices at each end of z are excluded, as in the flow average.
+    ScaLBL_Comm->RegularLayout(Map, &Velocity[2 * Np], Velocity_z);
+
+    int ny_global = Dm->nprocy() * (Ny - 2);
+    std::vector<double> sum(ny_global, 0.0), cnt(ny_global, 0.0);
+
+    int kmin = 4, kmax = Nz - 4; //skip halo plus the inlet/outlet buffer slices
+    if (kmin < 1) kmin = 1;
+    if (kmax > Nz - 1) kmax = Nz - 1;
+
+    for (int k = kmin; k < kmax; k++) {
+        for (int j = 1; j < Ny - 1; j++) {
+            int jg = Dm->jproc() * (Ny - 2) + (j - 1);
+            for (int i = 1; i < Nx - 1; i++) {
+                sum[jg] += Velocity_z(i, j, k);
+                cnt[jg] += 1.0;
+            }
+        }
+    }
+    //assemble the profile across all ranks
+    comm.sumReduce(sum.data(), ny_global);
+    comm.sumReduce(cnt.data(), ny_global);
+
+    if (rank == 0) {
+        FILE *fp = fopen("velocity_profile.txt", "w");
+        fprintf(fp, "# mean streamwise velocity across the channel\n");
+        fprintf(fp, "# tau = %.6g  tau_eff = %.6g  Forchheimer = %s\n", tau,
+                tau_eff, Forchheimer ? "on" : "off");
+        fprintf(fp, "# Fx = %.6g  Fy = %.6g  Fz = %.6g\n", Fx, Fy, Fz);
+        fprintf(fp, "# y  uz\n");
+        for (int jg = 0; jg < ny_global; jg++)
+            fprintf(fp, "%d %.10e\n", jg,
+                    cnt[jg] > 0.0 ? sum[jg] / cnt[jg] : 0.0);
+        fclose(fp);
+        printf("wrote velocity_profile.txt (%d points across y)\n", ny_global);
+    }
+
+    // The same average taken across x instead, for cases whose porosity varies
+    // in that direction: the transverse stack of Section 5.2 is layered across
+    // x with the flow along z, so ubar_z(x) is the profile that shows the
+    // interface condition, while ubar_z(y) averages the layers away.
+    int nx_global = Dm->nprocx() * (Nx - 2);
+    std::vector<double> sumx(nx_global, 0.0), cntx(nx_global, 0.0);
+
+    for (int k = kmin; k < kmax; k++) {
+        for (int j = 1; j < Ny - 1; j++) {
+            for (int i = 1; i < Nx - 1; i++) {
+                int ig = Dm->iproc() * (Nx - 2) + (i - 1);
+                sumx[ig] += Velocity_z(i, j, k);
+                cntx[ig] += 1.0;
+            }
+        }
+    }
+    comm.sumReduce(sumx.data(), nx_global);
+    comm.sumReduce(cntx.data(), nx_global);
+
+    if (rank == 0) {
+        FILE *fp = fopen("velocity_profile_x.txt", "w");
+        fprintf(fp, "# mean streamwise velocity across x\n");
+        fprintf(fp, "# tau = %.6g  tau_eff = %.6g  Forchheimer = %s\n", tau,
+                tau_eff, Forchheimer ? "on" : "off");
+        fprintf(fp, "# Fx = %.6g  Fy = %.6g  Fz = %.6g\n", Fx, Fy, Fz);
+        fprintf(fp, "# x  uz\n");
+        for (int ig = 0; ig < nx_global; ig++)
+            fprintf(fp, "%d %.10e\n", ig,
+                    cntx[ig] > 0.0 ? sumx[ig] / cntx[ig] : 0.0);
+        fclose(fp);
+        printf("wrote velocity_profile_x.txt (%d points across x)\n", nx_global);
+    }
 }
 
 void ScaLBL_GreyscaleModel::VelocityField() {
